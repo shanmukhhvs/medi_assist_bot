@@ -1,6 +1,18 @@
 import os
 import re
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.chunking import HybridChunker
+from docling_core.transforms.chunker.hierarchical_chunker import ChunkingDocSerializer, ChunkingSerializerProvider
+from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+from docling_core.transforms.serializer.markdown import MarkdownTableSerializer
+from docling_core.types.doc import DocItemLabel, DoclingDocument, SectionHeaderItem, TitleItem
+from transformers import AutoTokenizer
+
+from app.RAG.vector_store import DENSE_MODEL
 
 # Map collections to allowed roles
 COLLECTION_ROLE_MAP = {
@@ -11,162 +23,104 @@ COLLECTION_ROLE_MAP = {
     "equipment": ["technician", "admin"]
 }
 
-class HierarchicalDocumentParser:
-    """
-    Parses Markdown and PDF documents with structural awareness:
-    Preserves headings, tables, and code blocks.
-    Applies hierarchical chunking (section -> subsection -> paragraph/table)
-    and attaches parent section title as explicit context prefix.
-    """
-    def __init__(self, max_chunk_tokens: int = 400, overlap_tokens: int = 50):
-        self.max_chunk_tokens = max_chunk_tokens
-        self.overlap_tokens = overlap_tokens
+# Token budget per chunk, counted with the dense embedder's own tokenizer. all-MiniLM-L6-v2 truncates input at
+# 256 tokens, so a larger chunk would be silently cut at embedding time.
+MAX_CHUNK_TOKENS = 256
+# HybridChunker budgets the chunk body only; contextualize() then prepends the heading path. The longest heading
+# path in the provided documents is 34 tokens (measured), so the body gets MAX_CHUNK_TOKENS - 40; parse_file
+# fails loudly if a chunk still exceeds MAX_CHUNK_TOKENS.
+HEADING_TOKEN_RESERVE = 40
 
-    def estimate_tokens(self, text: str) -> int:
-        return len(text.split())
+SUPPORTED_EXTENSIONS = (".pdf", ".md")
+
+# Section numbering used by the provided PDFs: "A. Patient Monitoring ...", "1. Scope", "SOP 4 - IV Cannula ...".
+_NUMBERED_SECTION = re.compile(r"^(?:[A-Z]\.|\d+(?:\.\d+)*\.?|SOP\s+\d+\b)\s*\S")
+
+
+def _restore_heading_levels(doc: DoclingDocument) -> None:
+    """
+    Docling reports every PDF heading in the provided documents at level 1, so the chunk heading path would be
+    just the last heading seen (e.g. "Fault codes", which appears under four devices in the equipment manual).
+    Rebuild the hierarchy: first heading = document title (1), numbered section (2), unnumbered sub-heading (3).
+    Only applied when all headings share one level; Markdown input keeps its native levels.
+    """
+    headers = [item for item, _ in doc.iterate_items() if isinstance(item, SectionHeaderItem)]
+    if not headers or len({h.level for h in headers}) > 1 or any(isinstance(i, TitleItem) for i, _ in doc.iterate_items()):
+        return
+    headers[0].level = 1
+    for h in headers[1:]:
+        h.level = 2 if _NUMBERED_SECTION.match(h.text.strip()) else 3
+
+
+class _MarkdownTableSerializerProvider(ChunkingSerializerProvider):
+    """Serialize tables as Markdown (whole rows, header repeated on every split) instead of Docling's default
+    "row, column = value" triplets, which split a dosage or billing row across chunks."""
+
+    def get_serializer(self, doc):
+        return ChunkingDocSerializer(doc=doc, table_serializer=MarkdownTableSerializer())
+
+
+def _chunk_type(doc_items) -> str:
+    labels = {item.label for item in doc_items}
+    if DocItemLabel.TABLE in labels:
+        return "table"
+    if DocItemLabel.CODE in labels:
+        return "code"
+    if labels and labels <= {DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE}:
+        return "heading"
+    return "text"
+
+
+class DoclingHybridParser:
+    """
+    Structure-aware ingestion: Docling parses PDF/Markdown into a DoclingDocument (headings, tables, lists, code),
+    then Docling's HybridChunker splits along that structure first and enforces the token budget second.
+    Each chunk's embedded text is HybridChunker.contextualize(chunk), i.e. its heading path + body.
+    """
+
+    def __init__(self, max_tokens: int = MAX_CHUNK_TOKENS):
+        # The provided PDFs have a text layer, so OCR is off; TableFormer table-structure recognition stays on.
+        pdf_options = PdfPipelineOptions(do_ocr=False, do_table_structure=True)
+        self.converter = DocumentConverter(
+            allowed_formats=[InputFormat.PDF, InputFormat.MD],
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)},
+        )
+        self.max_tokens = max_tokens
+        hf_tokenizer = AutoTokenizer.from_pretrained(DENSE_MODEL)
+        self.tokenizer = HuggingFaceTokenizer(tokenizer=hf_tokenizer, max_tokens=max_tokens)
+        self.chunker = HybridChunker(
+            tokenizer=HuggingFaceTokenizer(tokenizer=hf_tokenizer, max_tokens=max_tokens - HEADING_TOKEN_RESERVE),
+            merge_peers=True,
+            repeat_table_header=True,
+            serializer_provider=_MarkdownTableSerializerProvider(),
+        )
+
+    def count_tokens(self, text: str) -> int:
+        return self.tokenizer.count_tokens(text)
 
     def parse_file(self, file_path: str, collection: str) -> List[Dict[str, Any]]:
+        if not file_path.lower().endswith(SUPPORTED_EXTENSIONS):
+            return []
         filename = os.path.basename(file_path)
-        access_roles = COLLECTION_ROLE_MAP.get(collection, ["admin"])
+        access_roles = COLLECTION_ROLE_MAP[collection]
 
-        if file_path.endswith(".md"):
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return self._parse_markdown_structure(content, filename, collection, access_roles)
-        elif file_path.endswith(".pdf"):
-            return self._parse_pdf_structure(file_path, filename, collection, access_roles)
-        else:
-            return []
+        doc = self.converter.convert(file_path).document
+        _restore_heading_levels(doc)
 
-    def _parse_markdown_structure(self, content: str, filename: str, collection: str, access_roles: List[str]) -> List[Dict[str, Any]]:
-        lines = content.split("\n")
         chunks = []
-        
-        current_h1 = filename.replace(".md", "").replace("_", " ").title()
-        current_h2 = ""
-        current_h3 = ""
-        
-        buffer = []
-        current_chunk_type = "text"
-
-        def flush_buffer(b_lines, section_title, chunk_type):
-            if not b_lines:
-                return
-            raw_text = "\n".join(b_lines).strip()
-            if not raw_text:
-                return
-            
-            # Construct context prefix
-            context_prefix = f"[Document: {filename} | Context: {section_title}]\n"
-            full_text = context_prefix + raw_text
-            
-            # Sub-split if token limit exceeded
-            if self.estimate_tokens(full_text) > self.max_chunk_tokens:
-                sub_parts = self._split_large_text(raw_text, self.max_chunk_tokens)
-                for part in sub_parts:
-                    chunks.append({
-                        "text": f"{context_prefix}{part}",
-                        "source_document": filename,
-                        "collection": collection,
-                        "access_roles": access_roles,
-                        "section_title": section_title,
-                        "chunk_type": chunk_type
-                    })
-            else:
-                chunks.append({
-                    "text": full_text,
-                    "source_document": filename,
-                    "collection": collection,
-                    "access_roles": access_roles,
-                    "section_title": section_title,
-                    "chunk_type": chunk_type
-                })
-
-        is_in_table = False
-
-        for line in lines:
-            line_str = line.strip()
-
-            # Heading 1 (# ...)
-            if line_str.startswith("# "):
-                flush_buffer(buffer, f"{current_h1} > {current_h2}".strip(" >"), current_chunk_type)
-                buffer = []
-                current_h1 = line_str.replace("# ", "").strip()
-                current_h2 = ""
-                current_h3 = ""
-                current_chunk_type = "heading"
-
-            # Heading 2 (## ...)
-            elif line_str.startswith("## "):
-                flush_buffer(buffer, f"{current_h1} > {current_h2}".strip(" >"), current_chunk_type)
-                buffer = []
-                current_h2 = line_str.replace("## ", "").strip()
-                current_h3 = ""
-                current_chunk_type = "heading"
-
-            # Heading 3 (### ...)
-            elif line_str.startswith("### "):
-                flush_buffer(buffer, f"{current_h1} > {current_h2} > {current_h3}".strip(" >"), current_chunk_type)
-                buffer = []
-                current_h3 = line_str.replace("### ", "").strip()
-                current_chunk_type = "heading"
-
-            # Table line
-            elif line_str.startswith("|"):
-                if not is_in_table:
-                    # Flush prior text buffer
-                    flush_buffer(buffer, f"{current_h1} > {current_h2} > {current_h3}".strip(" >"), current_chunk_type)
-                    buffer = []
-                    is_in_table = True
-                    current_chunk_type = "table"
-                buffer.append(line)
-
-            else:
-                if is_in_table:
-                    # End of table
-                    flush_buffer(buffer, f"{current_h1} > {current_h2} > {current_h3}".strip(" >"), "table")
-                    buffer = []
-                    is_in_table = False
-                    current_chunk_type = "text"
-                buffer.append(line)
-
-        # Final flush
-        active_title = f"{current_h1} > {current_h2} > {current_h3}".strip(" >")
-        flush_buffer(buffer, active_title, current_chunk_type if not is_in_table else "table")
-
+        for chunk in self.chunker.chunk(dl_doc=doc):
+            text = self.chunker.contextualize(chunk=chunk).strip()
+            if not text:
+                continue
+            if self.count_tokens(text) > self.max_tokens:
+                raise ValueError(f"{filename}: chunk exceeds {self.max_tokens} tokens; raise HEADING_TOKEN_RESERVE")
+            headings = chunk.meta.headings or [os.path.splitext(filename)[0].replace("_", " ").title()]
+            chunks.append({
+                "text": text,
+                "source_document": filename,
+                "collection": collection,
+                "access_roles": access_roles,
+                "section_title": " > ".join(headings),
+                "chunk_type": _chunk_type(chunk.meta.doc_items),
+            })
         return chunks
-
-    def _parse_pdf_structure(self, file_path: str, filename: str, collection: str, access_roles: List[str]) -> List[Dict[str, Any]]:
-        # Fallback PDF structural extractor using PyPDF2 or Docling if installed
-        try:
-            import PyPDF2
-            chunks = []
-            with open(file_path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
-                for idx, page in enumerate(reader.pages):
-                    text = page.extract_text()
-                    if not text.strip():
-                        continue
-                    section_title = f"Page {idx + 1}"
-                    context_prefix = f"[Document: {filename} | Context: {section_title}]\n"
-                    full_text = context_prefix + text.strip()
-                    chunks.append({
-                        "text": full_text,
-                        "source_document": filename,
-                        "collection": collection,
-                        "access_roles": access_roles,
-                        "section_title": section_title,
-                        "chunk_type": "text"
-                    })
-            return chunks
-        except Exception as e:
-            print(f"Error parsing PDF {filename}: {e}")
-            return []
-
-    def _split_large_text(self, text: str, max_words: int) -> List[str]:
-        words = text.split()
-        sub_chunks = []
-        for i in range(0, len(words), max_words - self.overlap_tokens):
-            chunk_words = words[i:i + max_words]
-            sub_chunks.append(" ".join(chunk_words))
-        return sub_chunks

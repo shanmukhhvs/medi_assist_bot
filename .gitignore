@@ -10,3 +10,4 @@ out/
 backend/qdrant_storage/
 .DS_Store
 *.log
+!.env.example

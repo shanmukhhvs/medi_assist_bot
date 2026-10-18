@@ -24,8 +24,10 @@ export async function loginUser(username: string, password: string): Promise<Use
   };
 }
 
-export async function fetchAccessibleCollections(role: Role): Promise<AccessibleCollectionsResponse> {
-  const res = await fetch(`${API_BASE_URL}/collections/${role}`);
+export async function fetchAccessibleCollections(role: Role, token: string): Promise<AccessibleCollectionsResponse> {
+  const res = await fetch(`${API_BASE_URL}/collections/${role}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
   if (!res.ok) {
     throw new Error('Failed to fetch accessible collections');
   }

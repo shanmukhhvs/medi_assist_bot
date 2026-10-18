@@ -26,8 +26,9 @@ export default function Home() {
   // Fetch collections whenever role changes
   useEffect(() => {
     async function loadPermissions() {
+      if (!currentSession.token) return;
       try {
-        const res = await fetchAccessibleCollections(currentSession.role);
+        const res = await fetchAccessibleCollections(currentSession.role, currentSession.token);
         setAccessibleCollections(res.collections || []);
         setSqlRagPermitted(res.sql_rag_permitted || false);
       } catch (err) {
@@ -35,7 +36,7 @@ export default function Home() {
       }
     }
     loadPermissions();
-  }, [currentSession.role]);
+  }, [currentSession.role, currentSession.token]);
 
   // Every session must carry a backend-issued token; on failure, keep the current session and ask the user to log in
   const signInAs = useCallback(async (newRole: Role) => {
